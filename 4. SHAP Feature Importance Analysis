@@ -1,0 +1,481 @@
+# =============================
+# Standalone SHAP Feature Importance Analysis (XGBoost - Fixed)
+# =============================
+from google.colab import drive
+drive.mount('/content/drive')
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+import pickle
+import joblib
+import shap
+from datetime import datetime
+import os
+import warnings
+import json
+
+warnings.filterwarnings('ignore', message='.*XGBoost.*')
+warnings.filterwarnings('ignore', category=FutureWarning)
+
+plt.rcParams['font.sans-serif'] = ['Arial Unicode MS', 'DejaVu Sans', 'Helvetica']
+plt.rcParams['axes.unicode_minus'] = False
+sns.set_style("whitegrid")
+
+# =============================
+# 1. Load saved model and data
+# =============================
+save_dir = "/content/drive/My Drive/2 auto results/model_results_20260307_162527"
+output_dir = f"{save_dir}/shap_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+os.makedirs(output_dir, exist_ok=True)
+
+print("="*70)
+print("Loading saved model and data")
+print("="*70)
+
+try:
+    # 1. 加载元数据
+    with open(f"{save_dir}/metadata.json", 'r') as f:
+        metadata = json.load(f)
+
+    best_model_name = metadata['best_model']
+    print(f"✓ Metadata loaded: Best model is '{best_model_name}'")
+
+    # 2. 加载最佳模型
+    best_model_dict = joblib.load(f"{save_dir}/best_model.pkl")
+
+    if isinstance(best_model_dict, dict):
+        best_model = best_model_dict['model']
+        model_type = best_model_dict.get('type', 'tree')
+    else:
+        best_model = best_model_dict
+        model_type = 'tree'
+    print(f"✓ Model loaded: {type(best_model).__name__} (Type: {model_type})")
+
+    # 3. 加载原始数据集
+    df_selected = pd.read_csv("/content/drive/MyDrive/2 auto results/autoinsurance_churn_selected.csv")
+    print(f"✓ Dataset loaded: {df_selected.shape}")
+
+    if 'Churn' in df_selected.columns:
+        X_selected = df_selected.drop(columns=['Churn'])
+        y_selected = df_selected['Churn']
+    else:
+        raise ValueError("'Churn' column not found")
+
+    feature_names = X_selected.columns.tolist()
+    print(f"✓ Features: {len(feature_names)} → {feature_names}")
+
+    # 4. 重新划分数据（与主流程一致）
+    from sklearn.model_selection import train_test_split
+
+    X_trainval, X_test, y_trainval, y_test = train_test_split(
+        X_selected, y_selected, test_size=0.2, stratify=y_selected, random_state=42
+    )
+    X_train, X_val, y_train, y_val = train_test_split(
+        X_trainval, y_trainval, test_size=0.25, stratify=y_trainval, random_state=42
+    )
+    print(f"✓ Data split: Train {X_train.shape} | Val {X_val.shape} | Test {X_test.shape}")
+
+except Exception as e:
+    print(f"✗ Loading failed: {e}")
+    import traceback; traceback.print_exc()
+    raise
+
+# =============================
+# 2. Preprocessing (match training pipeline)
+# =============================
+print("\n" + "="*70)
+print("Preprocessing data to match training pipeline")
+print("="*70)
+
+# 你的数据集有以下特征类型（根据你提供的信息）：
+# 数值: curr_ann_amt, days_tenure, age_in_years, income, has_children,
+#       length_of_residence, home_owner, college_degree, good_credit (9列)
+# 分类: cust_orig_date(日期), marital_status, home_market_value (3列)
+# 预处理后共15个特征
+
+try:
+    label_encoders = joblib.load(f"{save_dir}/label_encoders.pkl")
+    print(f"✓ Label encoders loaded: {list(label_encoders.keys())}")
+except FileNotFoundError:
+    label_encoders = {}
+    print("  Label encoders not found, will use raw data")
+
+def preprocess_features(X_df, label_encoders, fit=False):
+    """
+    复现训练时的预处理流程，输出15个特征的DataFrame
+    """
+    X = X_df.copy()
+
+    # --- 日期特征处理 ---
+    if 'cust_orig_date' in X.columns:
+        try:
+            X['cust_orig_date'] = pd.to_datetime(X['cust_orig_date'], errors='coerce')
+            ref_date = pd.Timestamp('2026-01-01')
+            X['cust_tenure_days'] = (ref_date - X['cust_orig_date']).dt.days.fillna(0).astype(int)
+            X = X.drop(columns=['cust_orig_date'])
+            print("  ✓ cust_orig_date → cust_tenure_days")
+        except Exception as e:
+            print(f"  Date processing failed: {e}")
+            X = X.drop(columns=['cust_orig_date'], errors='ignore')
+
+    # --- home_market_value 有序编码 ---
+    if 'home_market_value' in X.columns:
+        if 'home_market_value' in label_encoders:
+            le = label_encoders['home_market_value']
+            X['home_market_value'] = X['home_market_value'].map(
+                lambda v: le.transform([v])[0] if v in le.classes_ else -1
+            )
+        else:
+            # 备用：提取范围下界
+            def parse_range(val):
+                if pd.isna(val): return 0
+                try:
+                    return int(str(val).split(' - ')[0].replace(',', '').strip())
+                except:
+                    return 0
+            X['home_market_value'] = X['home_market_value'].apply(parse_range)
+        print("  ✓ home_market_value encoded")
+
+    # --- marital_status 编码 ---
+    if 'marital_status' in X.columns:
+        if 'marital_status' in label_encoders:
+            le = label_encoders['marital_status']
+            X['marital_status'] = X['marital_status'].map(
+                lambda v: le.transform([v])[0] if v in le.classes_ else -1
+            )
+        else:
+            X['marital_status'] = pd.Categorical(X['marital_status']).codes
+        print("  ✓ marital_status encoded")
+
+    # --- 缺失值填充 ---
+    X = X.fillna(0)
+
+    return X
+
+# 预处理训练集和测试集
+X_train_processed = preprocess_features(X_train, label_encoders)
+X_test_processed  = preprocess_features(X_test,  label_encoders)
+
+print(f"\n✓ Train processed: {X_train_processed.shape}")
+print(f"✓ Test processed:  {X_test_processed.shape}")
+print(f"  Columns: {X_train_processed.columns.tolist()}")
+
+# ---- 关键：与模型训练特征对齐 ----
+if hasattr(best_model, 'feature_names_in_'):
+    model_features = list(best_model.feature_names_in_)
+    print(f"\n✓ Model expects {len(model_features)} features: {model_features}")
+
+    # 补充缺失列（填0），删除多余列
+    for col in model_features:
+        if col not in X_train_processed.columns:
+            X_train_processed[col] = 0
+            X_test_processed[col]  = 0
+            print(f"  Added missing column: {col}")
+
+    X_train_processed = X_train_processed[model_features]
+    X_test_processed  = X_test_processed[model_features]
+else:
+    model_features = X_train_processed.columns.tolist()
+    print(f"  Model has no feature_names_in_, using {len(model_features)} columns")
+
+feature_names_for_shap = model_features
+print(f"\n✓ Final feature count: {len(feature_names_for_shap)}")
+
+# ---- 快速验证预测是否正常 ----
+try:
+    test_pred = best_model.predict_proba(X_test_processed.head(5))
+    print(f"✓ Prediction test passed: {test_pred.shape}")
+except Exception as e:
+    print(f"✗ Prediction test failed: {e}")
+    raise
+
+# =============================
+# 3. SHAP Values Computation
+# =============================
+print("\n" + "="*70)
+print("Computing SHAP Values")
+print("="*70)
+
+try:
+    background_size = min(200, len(X_train_processed))
+    background_df = X_train_processed.sample(n=background_size, random_state=42)
+
+    explainer = shap.TreeExplainer(best_model, background_df)
+    print(f"✓ TreeExplainer initialized (background: {background_df.shape})")
+
+    test_sample_size = min(500, len(X_test_processed))
+    sample_idx_positions = np.random.RandomState(42).choice(
+        len(X_test_processed), test_sample_size, replace=False
+    )
+    # sample_indices 是 X_test 中的整数位置
+    sample_indices = sample_idx_positions
+
+    test_sample_df = X_test_processed.iloc[sample_idx_positions].reset_index(drop=True)
+    test_sample_array = test_sample_df.values
+
+    print(f"✓ Test sample: {test_sample_df.shape}")
+
+    shap_values = explainer.shap_values(test_sample_df)
+
+    # XGBoost 输出格式处理
+    if isinstance(shap_values, list) and len(shap_values) == 2:
+        shap_values_positive = shap_values[1]
+        print("  ✓ List format → extracted class-1 SHAP values")
+    elif isinstance(shap_values, np.ndarray) and shap_values.ndim == 3:
+        shap_values_positive = shap_values[:, :, 1]
+        print("  ✓ 3D array → extracted class-1 SHAP values")
+    else:
+        shap_values_positive = shap_values
+        print(f"  ✓ Using SHAP values directly: {shap_values_positive.shape}")
+
+    # Base value
+    ev = explainer.expected_value
+    if isinstance(ev, (list, np.ndarray)):
+        base_value = float(ev[1]) if len(ev) > 1 else float(ev[0])
+    else:
+        base_value = float(ev)
+
+    print(f"✓ SHAP computation complete: {shap_values_positive.shape}")
+    print(f"  Base value: {base_value:.4f}")
+
+except Exception as e:
+    print(f"✗ SHAP computation failed: {e}")
+    import traceback; traceback.print_exc()
+    raise
+
+# =============================
+# 4. Global Feature Importance
+# =============================
+print("\n" + "="*70)
+print("Global Feature Importance")
+print("="*70)
+
+shap_mean_abs = np.mean(np.abs(shap_values_positive), axis=0)
+
+if len(feature_names_for_shap) != len(shap_mean_abs):
+    print(f"  Mismatch: {len(feature_names_for_shap)} names vs {len(shap_mean_abs)} values → using generic names")
+    feature_names_for_shap = [f'feature_{i}' for i in range(len(shap_mean_abs))]
+    test_sample_df = pd.DataFrame(test_sample_array, columns=feature_names_for_shap)
+
+feature_importance = pd.DataFrame({
+    'Feature': feature_names_for_shap,
+    'SHAP_Importance': shap_mean_abs
+}).sort_values('SHAP_Importance', ascending=False).reset_index(drop=True)
+
+print("\nTop 15 Most Important Features:")
+print("-" * 60)
+for i, row in feature_importance.head(15).iterrows():
+    print(f"  {i+1:2d}. {row['Feature']:<40} {row['SHAP_Importance']:.6f}")
+
+feature_importance.to_csv(f"{output_dir}/shap_feature_importance.csv", index=False)
+print(f"\n✓ Saved: shap_feature_importance.csv")
+
+# =============================
+# 5. Visualizations
+# =============================
+print("\n" + "="*70)
+print("Generating Visualizations")
+print("="*70)
+
+# Bar plot
+print("1. Bar plot...")
+plt.figure(figsize=(12, 8))
+shap.summary_plot(shap_values_positive, test_sample_df, plot_type="bar", max_display=15, show=False)
+plt.title("Top 15 Features by SHAP Importance", fontsize=16, fontweight='bold')
+plt.tight_layout()
+plt.savefig(f"{output_dir}/shap_bar_plot.png", dpi=300, bbox_inches='tight')
+plt.show()
+print("   ✓ Saved: shap_bar_plot.png")
+
+# Beeswarm plot
+print("2. Beeswarm plot...")
+plt.figure(figsize=(12, 9))
+shap.summary_plot(shap_values_positive, test_sample_df, max_display=15, show=False)
+plt.title("SHAP Value Distribution by Feature\n(Red = High value → Higher churn risk)",
+          fontsize=14, fontweight='bold', pad=20)
+plt.tight_layout()
+plt.savefig(f"{output_dir}/shap_beeswarm_plot.png", dpi=300, bbox_inches='tight')
+plt.show()
+print("   ✓ Saved: shap_beeswarm_plot.png")
+
+# Dependence plots (Top 5)
+print("3. Dependence plots (Top 5)...")
+top_5_features = feature_importance.head(5)['Feature'].tolist()
+for rank, feat in enumerate(top_5_features, 1):
+    try:
+        plt.figure(figsize=(10, 6))
+        shap.dependence_plot(feat, shap_values_positive, test_sample_df, show=False)
+        plt.title(f"SHAP Dependence: {feat}", fontsize=14, fontweight='bold')
+        plt.tight_layout()
+        safe_name = feat.replace('/', '_').replace('\\', '_')
+        plt.savefig(f"{output_dir}/shap_dependence_{rank}_{safe_name}.png", dpi=300, bbox_inches='tight')
+        plt.show()
+        print(f"   ✓ Saved: shap_dependence_{rank}_{feat}.png")
+    except Exception as e:
+        print(f"     Failed for {feat}: {e}")
+
+# =============================
+# 6. Individual Customer Explanations (FIXED)
+# =============================
+print("\n" + "="*70)
+print("Individual Customer Explanations")
+print("="*70)
+
+# y_test 对应整个 X_test，需要重置索引以便用整数位置访问
+y_test_reset = y_test.reset_index(drop=True)
+
+quartile_positions = [0, len(sample_indices)//4, len(sample_indices)//2, 3*len(sample_indices)//4]
+
+for i, pos in enumerate(quartile_positions):
+    if pos >= len(sample_indices):
+        continue
+
+    # pos 是在 test_sample_df 里的行位置（0~499）
+    customer_data_series = test_sample_df.iloc[pos]   # DataFrame 行，保留列名
+    customer_data_array  = customer_data_series.values.reshape(1, -1)
+
+    # 对应原始 X_test 中的整数位置
+    original_pos = sample_indices[pos]
+    true_label   = "Churned" if y_test_reset.iloc[original_pos] == 1 else "Retained"
+
+    # ---- 关键修复：用 DataFrame 传入，保留列名 ----
+    customer_df = pd.DataFrame(customer_data_array, columns=feature_names_for_shap)
+    pred_proba  = best_model.predict_proba(customer_df)[0, 1]
+    pred_label  = "High Risk" if pred_proba > 0.5 else "Low Risk"
+
+    print(f"\n Customer {i+1} (Sample position: {pos}, Original test index: {original_pos})")
+    print(f"   Actual: {true_label} | Predicted: {pred_label} (Prob: {pred_proba:.3f})")
+
+    try:
+        plt.figure(figsize=(12, 8))
+        explanation = shap.Explanation(
+            values=shap_values_positive[pos],
+            base_values=base_value,
+            data=customer_data_series.values,
+            feature_names=feature_names_for_shap
+        )
+        shap.waterfall_plot(explanation, max_display=15, show=False)
+        plt.title(
+            f"Customer {i+1} – {true_label} | Risk: {pred_label} ({pred_proba:.2f})",
+            fontsize=14, fontweight='bold'
+        )
+        plt.tight_layout()
+        plt.savefig(f"{output_dir}/shap_waterfall_customer_{i+1}.png", dpi=300, bbox_inches='tight')
+        plt.show()
+        print(f"   ✓ Saved: shap_waterfall_customer_{i+1}.png")
+    except Exception as e:
+        print(f"     Waterfall failed: {e}")
+        import traceback; traceback.print_exc()
+
+# =============================
+# 7. Feature Group Analysis
+# =============================
+print("\n" + "="*70)
+print("Feature Group Analysis")
+print("="*70)
+
+feature_groups = {
+    'Customer Profile':   ['age', 'income', 'children', 'marital', 'education', 'college', 'credit', 'occupation'],
+    'Policy & Finance':   ['curr_ann_amt', 'premium', 'coverage', 'deductible', 'good_credit'],
+    'Property & Home':    ['home', 'residence', 'market_value', 'property'],
+    'Tenure & Time':      ['tenure', 'days', 'cust_orig', 'duration', 'month', 'year'],
+}
+
+group_importance = {}
+for group_name, keywords in feature_groups.items():
+    matched = [f for f in feature_importance['Feature']
+               if any(k.lower() in f.lower() for k in keywords)]
+    if matched:
+        score = feature_importance[feature_importance['Feature'].isin(matched)]['SHAP_Importance'].sum()
+        count = len(matched)
+        group_importance[group_name] = {
+            'score': score, 'count': count,
+            'avg': score / count if count > 0 else 0,
+            'features': matched
+        }
+
+sorted_groups = sorted(group_importance.items(), key=lambda x: x[1]['score'], reverse=True)
+
+print("\nGroup Importance Ranking:")
+print("-" * 70)
+for rank, (name, info) in enumerate(sorted_groups, 1):
+    print(f"{rank}. {name:<22} | Total: {info['score']:.4f} | "
+          f"Count: {info['count']:2d} | Avg: {info['avg']:.4f}")
+    top3 = feature_importance[feature_importance['Feature'].isin(info['features'])].head(3)
+    for _, row in top3.iterrows():
+        print(f"   └ {row['Feature']:<40} {row['SHAP_Importance']:.6f}")
+
+group_summary = pd.DataFrame([
+    {'Group': name, 'Total': info['score'], 'Count': info['count'], 'Avg': info['avg']}
+    for name, info in sorted_groups
+])
+group_summary.to_csv(f"{output_dir}/shap_group_importance.csv", index=False)
+print(f"\n✓ Saved: shap_group_importance.csv")
+
+# =============================
+# 8. Business Insights
+# =============================
+print("\n" + "="*70)
+print("Business Insights")
+print("="*70)
+
+top5  = feature_importance.head(5)
+top10 = feature_importance.head(10)
+total_importance = feature_importance['SHAP_Importance'].sum()
+top5_pct  = top5['SHAP_Importance'].sum()  / total_importance * 100
+top10_pct = top10['SHAP_Importance'].sum() / total_importance * 100
+
+print(f"\n1. Top 5 Churn Drivers:")
+for _, row in top5.iterrows():
+    print(f"   • {row['Feature']:<40} (SHAP: {row['SHAP_Importance']:.4f})")
+
+print(f"\n2. Feature Concentration:")
+print(f"   • Top 5:  {top5_pct:.1f}% of model behavior")
+print(f"   • Top 10: {top10_pct:.1f}% of model behavior")
+
+print(f"\n3. Recommendations:")
+print(f"   → Monitor top feature: '{top5.iloc[0]['Feature']}'")
+print(f"   → Build early-warning alerts on Top 5 features")
+print(f"   → Top 10 features cover {top10_pct:.0f}% of predictive power")
+
+# =============================
+# 9. Save Complete Results
+# =============================
+print("\n" + "="*70)
+print("Saving Results")
+print("="*70)
+
+shap_output = {
+    'model_name': best_model_name,
+    'model_type': model_type,
+    'feature_importance': feature_importance,
+    'shap_values': shap_values_positive,
+    'sample_indices': sample_indices.tolist(),
+    'base_value': base_value,
+    'feature_names': feature_names_for_shap,
+    'analysis_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+}
+
+with open(f"{output_dir}/shap_complete_results.pkl", 'wb') as f:
+    pickle.dump(shap_output, f)
+
+with open(f"{output_dir}/shap_report.txt", 'w', encoding='utf-8') as f:
+    f.write("SHAP Analysis Report\n")
+    f.write("="*70 + "\n\n")
+    f.write(f"Model: {best_model_name}\n")
+    f.write(f"Date:  {datetime.now().strftime('%Y-%m-%d %H:%M')}\n")
+    f.write(f"Features: {len(feature_names_for_shap)}\n\n")
+    f.write("Top 15 Features:\n")
+    for i, row in feature_importance.head(15).iterrows():
+        f.write(f"  {i+1:2d}. {row['Feature']:<40} {row['SHAP_Importance']:.6f}\n")
+    f.write(f"\nTop 5 contribution:  {top5_pct:.1f}%\n")
+    f.write(f"Top 10 contribution: {top10_pct:.1f}%\n")
+
+print(f"✓ All results saved to:")
+print(f"  {output_dir}")
+
+print("\n" + "="*70)
+print("SHAP ANALYSIS COMPLETED!")
+print("="*70)
