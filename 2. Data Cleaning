@@ -1,0 +1,525 @@
+# =============================
+# Data Cleaning
+# =============================
+
+from google.colab import drive
+drive.mount('/content/drive')
+
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import numpy as np
+from scipy import stats
+import warnings
+import os
+from datetime import datetime
+warnings.filterwarnings('ignore')
+
+# Load data
+file_path = "/content/drive/My Drive/autoinsurance_churn.csv"
+df_original = pd.read_csv(file_path)
+target_col = "Churn"
+
+print(f"=== Original Data Overview ===")
+print(f"Data size: {df_original.shape}")
+print(f"Column preview: {list(df_original.columns[:10])}")
+
+# Step 1: Copy data to preserve original
+df_current = df_original.copy()
+
+# =============================
+# Step 1: Remove Useless Columns
+# =============================
+print("\n" + "="*50)
+print("Step 1: Remove Useless Columns")
+print("="*50)
+
+def remove_useless_columns(df, target_col=None):
+    """Remove columns with no predictive value"""
+    before_cols = set(df.columns)
+
+    # (1) Columns with only one unique value
+    useless_cols = df.nunique()[df.nunique() == 1].index.tolist()
+
+    # (2) Business-irrelevant columns (IDs, addresses, etc.)
+    potential_drop_cols = [
+       "city", "county", "latitude", "longitude", "individual_id",
+        "address_id", "date_of_birth"
+    ]
+
+    # Keep only existing columns
+    to_drop = [col for col in (useless_cols + potential_drop_cols) if col in df.columns]
+
+    # Never drop target column
+    if target_col and target_col in to_drop:
+        to_drop.remove(target_col)
+
+    # Perform drop
+    df_cleaned = df.drop(columns=to_drop) if to_drop else df.copy()
+    after_cols = set(df_cleaned.columns)
+
+    print(f"Features before removal: {len(before_cols)}")
+    print(f"Features after removal: {len(after_cols)}")
+    print(f"Removed features ({len(to_drop)}): {to_drop}")
+    print(f"Retained features: {len(after_cols)}")
+
+    return df_cleaned, to_drop
+
+# Execute Step 1
+df_current, dropped_useless = remove_useless_columns(df_current, target_col)
+
+# =============================
+# Step 2: Redundant Variable Detection
+# =============================
+print("\n" + "="*50)
+print("Step 2: Redundant Variable Detection")
+print("="*50)
+
+def detect_redundant_variables(df, corr_threshold=0.9, target_col=None):
+    """Detect and remove highly correlated redundant features"""
+    before_cols = set(df.columns)
+    num_cols = df.select_dtypes(include=[np.number]).columns
+    redundant_pairs = []
+    redundant_cols = []
+
+    if len(num_cols) > 1:
+        corr_matrix = df[num_cols].corr().abs()
+        upper_triangle = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
+
+        for row in upper_triangle.index:
+            for col in upper_triangle.columns:
+                val = upper_triangle.loc[row, col]
+                if not pd.isnull(val) and val > corr_threshold:
+                    redundant_pairs.append((row, col, round(val, 3)))
+
+        for pair in redundant_pairs:
+            col_to_drop = pair[1]
+            if col_to_drop != target_col and col_to_drop not in redundant_cols:
+                redundant_cols.append(col_to_drop)
+
+        df_cleaned = df.drop(columns=[c for c in redundant_cols if c in df.columns]) if redundant_cols else df.copy()
+        after_cols = set(df_cleaned.columns)
+
+        print(f"Features before redundancy check: {len(before_cols)}")
+        print(f"Features after redundancy check: {len(after_cols)}")
+        print(f"Removed redundant features ({len(redundant_cols)}): {redundant_cols}")
+        print(f"Number of high-correlation pairs found: {len(redundant_pairs)}")
+
+        if redundant_pairs:
+            redundant_df = pd.DataFrame(redundant_pairs, columns=["Feature A", "Feature B", "Correlation"])
+            redundant_df["Suggested Removal"] = redundant_df["Feature B"]
+            print("\nTop 10 redundant pairs:")
+            print(redundant_df.head(10))
+
+            output_path = "/content/drive/My Drive/2 auto results/Redundant_Variables_Report.xlsx"
+            redundant_df.to_excel(output_path, index=False)
+            print(f"\nRedundant variable report saved to: {output_path}")
+        else:
+            print("No highly correlated pairs found")
+    else:
+        print("Not enough numeric columns. Skipping redundancy detection.")
+        df_cleaned = df.copy()
+        redundant_cols = []
+
+    return df_cleaned, redundant_cols
+
+# Execute Step 2
+df_current, dropped_redundant = detect_redundant_variables(df_current, target_col=target_col)
+
+# =============================
+# Step 3: Smart Missing Value Handling
+# =============================
+print("\n" + "="*50)
+print("Step 3: Smart Missing Value Handling")
+print("="*50)
+
+def analyze_missing_pattern(df, target_col=None):
+    """Analyze missing value patterns"""
+    print("--- Missing Value Pattern Analysis ---")
+    total_rows = df.shape[0]
+    total_cols = df.shape[1]
+    missing_by_col = df.isnull().sum()
+    missing_ratio_by_col = (missing_by_col / total_rows * 100).round(2)
+    missing_by_row = df.isnull().sum(axis=1)
+    rows_with_missing = (missing_by_row > 0).sum()
+    missing_ratio_by_row = (rows_with_missing / total_rows * 100).round(2)
+
+    missing_summary = pd.DataFrame({
+        'Missing Count': missing_by_col,
+        'Missing Rate (%)': missing_ratio_by_col,
+        'Data Type': df.dtypes
+    }).sort_values('Missing Rate (%)', ascending=False)
+
+    print(f"Data size: {total_rows} rows × {total_cols} columns")
+    print(f"Rows with missing values: {rows_with_missing} ({missing_ratio_by_row}%)")
+    print(f"Columns with missing values: {(missing_by_col > 0).sum()}")
+    print("\nTop 10 columns with highest missing rates:")
+    print(missing_summary.head(10))
+
+    return missing_summary, rows_with_missing, missing_ratio_by_row
+
+def smart_missing_value_processing(df, target_col=None, row_threshold=15, col_threshold=50):
+    """Intelligent missing value handling with strategy decision"""
+    missing_summary, rows_with_missing, missing_ratio_by_row = analyze_missing_pattern(df, target_col)
+
+    print(f"\n--- Processing Strategy (Row threshold: {row_threshold}%, Column threshold: {col_threshold}%) ---")
+    cols_to_drop = missing_summary[missing_summary['Missing Rate (%)'] > col_threshold].index.tolist()
+    if target_col and target_col in cols_to_drop:
+        cols_to_drop.remove(target_col)
+
+    drop_rows = missing_ratio_by_row <= row_threshold
+
+    print(f"Column strategy: Remove {len(cols_to_drop)} columns (missing rate > {col_threshold}%)")
+    if cols_to_drop:
+        print(f"  Columns to remove: {cols_to_drop}")
+
+    if drop_rows:
+        print(f"Row strategy: Remove rows with missing values (affects {missing_ratio_by_row}% of data – acceptable)")
+    else:
+        print(f"Row strategy: Impute values (deleting rows would lose {missing_ratio_by_row}% – too much loss)")
+
+    print("\n--- Executing Missing Value Handling ---")
+    df_processed = df.copy()
+
+    if cols_to_drop:
+        print(f"Removing {len(cols_to_drop)} high-missing columns...")
+        df_processed = df_processed.drop(columns=cols_to_drop)
+        print(f"Columns after removal: {df_processed.shape[1]}")
+
+    if drop_rows:
+        before = df_processed.shape[0]
+        df_processed = df_processed.dropna()
+        after = df_processed.shape[0]
+        print(f"Removed rows with missing values: {before} → {after} (reduced by {before - after})")
+    else:
+        print("Imputing remaining missing values...")
+        fill_report = []
+        for col in df_processed.columns:
+            if df_processed[col].isnull().sum() > 0:
+                if df_processed[col].dtype in ['int64', 'float64', 'int32', 'float32']:
+                    fill_value = df_processed[col].median()
+                    df_processed[col].fillna(fill_value, inplace=True)
+                    fill_report.append([col, 'Numeric', f'Median: {fill_value:.2f}'])
+                else:
+                    mode_val = df_processed[col].mode()
+                    if not mode_val.empty:
+                        fill_value = mode_val[0]
+                        df_processed[col].fillna(fill_value, inplace=True)
+                        fill_report.append([col, 'Categorical', f'Mode: {fill_value}'])
+                    else:
+                        df_processed[col].fillna('Unknown', inplace=True)
+                        fill_report.append([col, 'Categorical', 'Default: Unknown'])
+
+        if fill_report:
+            fill_df = pd.DataFrame(fill_report, columns=['Feature', 'Type', 'Imputation Method'])
+            print(f"Imputed missing values for {len(fill_report)} features:")
+            print(fill_df.head(10))
+            report_path = "/content/drive/My Drive/2 auto results/Missing_Value_Imputation_Report.xlsx"
+            fill_df.to_excel(report_path, index=False)
+            print(f"Imputation report saved to: {report_path}")
+
+    final_missing = df_processed.isnull().sum().sum()
+    print(f"\nTotal missing values after processing: {final_missing}")
+    print(f"Final data size: {df_processed.shape}")
+    return df_processed, cols_to_drop
+
+# Execute Step 3
+df_current, dropped_missing = smart_missing_value_processing(df_current, target_col)
+
+# =============================
+# Step 4: Outlier Detection and Handling (with detailed logs)
+# =============================
+print("\n" + "="*50)
+print("Step 4: Outlier Detection and Handling")
+print("="*50)
+
+def detect_and_handle_outliers(df, target_col=None):
+    """Outlier detection with business rules and detailed reporting"""
+    df_processed = df.copy()
+    num_cols = df_processed.select_dtypes(include=[np.number]).columns.tolist()
+    if target_col and target_col in num_cols:
+        num_cols = [col for col in num_cols if col != target_col]
+
+    outlier_report = []
+    all_outliers_details = []
+    non_negative_cols = ["length_of_residence"]
+    for col in num_cols:
+        lower_col = col.lower()
+        if any(k in lower_col for k in ["income", "salary", "tenure", "days", "amount", "amt", "premium", "claim"]):
+            if col not in non_negative_cols:
+                non_negative_cols.append(col)
+
+    # Check for negative values in non-negative columns
+    print("\n=== Checking Negative Values in Non-Negative Columns (Before Fix) ===")
+    negative_values_details = []
+    for col in non_negative_cols:
+        if col in df_processed.columns:
+            neg_mask = df_processed[col] < 0
+            neg_count = neg_mask.sum()
+            if neg_count > 0:
+                print(f"Feature {col}: Found {neg_count} negative values (will be removed)")
+                neg_data = df_processed[neg_mask].copy()
+                neg_data['Outlier Feature'] = col
+                neg_data['Outlier Type'] = 'Negative Value'
+                neg_data['Outlier Value'] = neg_data[col]
+                negative_values_details.append(neg_data)
+            else:
+                print(f"Feature {col}: No negative values")
+
+    # IQR-based outlier detection
+    print("\nDetecting outliers using IQR method...")
+    skipped_binary = []
+    for col in num_cols:
+        unique_vals = df_processed[col].dropna().unique()
+        if len(unique_vals) <= 2:
+            skipped_binary.append(col)
+            print(f"  Skipping binary feature: {col} (values: {sorted(unique_vals)})")
+            continue
+
+        Q1 = df_processed[col].quantile(0.25)
+        Q3 = df_processed[col].quantile(0.75)
+        IQR = Q3 - Q1
+        if IQR <= 0:
+            continue
+
+        lower_bound = Q1 - 1.5 * IQR
+        upper_bound = Q3 + 1.5 * IQR
+
+        # Business protection rules
+        if col in non_negative_cols:
+            lower_bound = max(lower_bound, 0)
+        elif 'age' in col.lower():
+            lower_bound = max(lower_bound, 18)
+            upper_bound = min(upper_bound, 100)
+        elif any(k in col.lower() for k in ['ratio', 'rate']):
+            lower_bound = max(lower_bound, 0)
+            if upper_bound <= 1.5:
+                upper_bound = min(upper_bound, 1)
+
+        outliers_mask = (df_processed[col] < lower_bound) | (df_processed[col] > upper_bound)
+        outlier_count = outliers_mask.sum()
+        if outlier_count > 0:
+            outlier_data = df_processed[outliers_mask].copy()
+            outlier_data['Outlier Feature'] = col
+            outlier_data['Outlier Type'] = outlier_data[col].apply(lambda x: 'Below Lower Bound' if x < lower_bound else 'Above Upper Bound')
+            outlier_data['Outlier Value'] = outlier_data[col]
+            outlier_data['Lower Bound'] = lower_bound
+            outlier_data['Upper Bound'] = upper_bound
+            all_outliers_details.append(outlier_data)
+
+        # Winsorize (cap outliers)
+        df_processed[col] = np.where(df_processed[col] < lower_bound, lower_bound, df_processed[col])
+        df_processed[col] = np.where(df_processed[col] > upper_bound, upper_bound, df_processed[col])
+
+        outlier_ratio = outlier_count / len(df_processed) * 100
+        outlier_report.append([col, outlier_count, round(outlier_ratio, 2), round(lower_bound, 2), round(upper_bound, 2)])
+
+    if skipped_binary:
+        print(f"\nSkipped {len(skipped_binary)} binary/categorical features")
+
+    # Remove negative values
+    total_removed = 0
+    for col in non_negative_cols:
+        if col in df_processed.columns:
+            before = df_processed.shape[0]
+            df_processed = df_processed[df_processed[col] >= 0]
+            removed = before - df_processed.shape[0]
+            total_removed += removed
+            if removed > 0:
+                print(f"Feature {col}: Removed {removed} rows with negative values")
+
+    # Save outlier summary
+    if outlier_report:
+        outlier_summary = pd.DataFrame(outlier_report, columns=["Feature", "Outlier Count", "Outlier %", "Lower Bound", "Upper Bound"])
+        outlier_summary_sorted = outlier_summary.sort_values(by="Outlier %", ascending=False)
+        print("\n=== IQR Outlier Detection Results (sorted by %) ===")
+        print(outlier_summary_sorted)
+        output_path = "/content/drive/My Drive/2 auto results/Outlier_Detection_Report_Enhanced.xlsx"
+        outlier_summary_sorted.to_excel(output_path, index=False)
+        print(f"\nOutlier report saved to: {output_path}")
+
+    # Save detailed outlier records
+    if all_outliers_details:
+        all_outliers_df = pd.concat(all_outliers_details, ignore_index=True)
+        detail_path = "/content/drive/My Drive/2 auto results/IQR_Outlier_Details.xlsx"
+        with pd.ExcelWriter(detail_path, engine='openpyxl') as writer:
+            all_outliers_df.to_excel(writer, sheet_name='Outlier Details', index=False)
+            all_outliers_df.groupby(['Outlier Feature', 'Outlier Type']).size().reset_index(name='Count').to_excel(writer, sheet_name='Summary by Feature', index=False)
+        print(f"IQR outlier details saved to: {detail_path} ({len(all_outliers_df)} records)")
+
+    if negative_values_details:
+        neg_df = pd.concat(negative_values_details, ignore_index=True)
+        neg_path = "/content/drive/My Drive/2 auto results/Negative_Value_Details.xlsx"
+        with pd.ExcelWriter(neg_path, engine='openpyxl') as writer:
+            neg_df.to_excel(writer, sheet_name='Negative Values', index=False)
+            neg_df.groupby('Outlier Feature').size().reset_index(name='Count').to_excel(writer, sheet_name='Summary', index=False)
+        print(f"Negative value details saved to: {neg_path} ({len(neg_df)} records)")
+
+    print(f"\nBusiness rules removed {total_removed} rows due to negative values")
+    print(f"Data size after processing: {df_processed.shape}")
+
+    # Final quality check
+    print("\n=== Final Data Quality Check ===")
+    final_neg = sum((df_processed[col] < 0).sum() for col in non_negative_cols if col in df_processed.columns)
+    if final_neg == 0:
+        print("All non-negative features are now valid")
+    final_missing = df_processed.isnull().sum().sum()
+    if final_missing == 0:
+        print("No missing values remain")
+    return df_processed, outlier_report
+
+# Execute Step 4
+df_current, outlier_info = detect_and_handle_outliers(df_current, target_col)
+
+# =============================
+# Step 5: Visualization Analysis
+# =============================
+print("\n" + "="*50)
+print("Step 5: Visualization Analysis")
+print("="*50)
+
+def generate_visualizations(df, target_col=None, output_dir=None):
+    """Generate and save visualizations for key numeric features"""
+    if output_dir is None:
+        output_dir = "/content/drive/My Drive/2 auto results/Step5_Visualizations"
+    os.makedirs(output_dir, exist_ok=True)
+
+    results_file = os.path.join(output_dir, "Step5_Visualization_Statistics.txt")
+    results = open(results_file, 'w', encoding='utf-8')
+    results.write("="*80 + "\n")
+    results.write("Step 5: Visualization Report\n")
+    results.write(f"Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+    results.write("="*80 + "\n\n")
+
+    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    if target_col and target_col in numeric_cols:
+        numeric_cols = [col for col in numeric_cols if col != target_col]
+
+    print(f"Found {len(numeric_cols)} numeric features")
+    results.write(f"Found {len(numeric_cols)} numeric features\n")
+    results.write(f"List: {numeric_cols}\n\n")
+
+    if not numeric_cols:
+        print("No numeric features to visualize")
+        results.close()
+        return
+
+    cols_to_plot = numeric_cols[:3]
+    print(f"Generating charts for: {cols_to_plot}")
+    results.write(f"Selected features: {cols_to_plot}\n\n")
+
+    successful = []
+    for i, col in enumerate(cols_to_plot):
+        if col not in df.columns or df[col].nunique() <= 1:
+            continue
+        try:
+            plt.figure(figsize=(12, 5))
+            # Boxplot
+            plt.subplot(1, 3, 1)
+            sns.boxplot(y=df[col])
+            plt.title(f"{col} - Box Plot")
+            plt.ylabel(col)
+
+            # Histogram
+            plt.subplot(1, 3, 2)
+            plt.hist(df[col].dropna(), bins=30, alpha=0.7, edgecolor='black')
+            plt.title(f"{col} - Distribution")
+            plt.xlabel(col)
+            plt.ylabel("Frequency")
+
+            # Stats text
+            stats_text = f"""Basic Statistics
+Count: {df[col].count()}
+Mean: {df[col].mean():.2f}
+Median: {df[col].median():.2f}
+Std Dev: {df[col].std():.2f}
+Min: {df[col].min():.2f}
+Max: {df[col].max():.2f}
+Missing: {df[col].isnull().sum()}"""
+            plt.subplot(1, 3, 3)
+            plt.text(0.1, 0.5, stats_text, transform=plt.gca().transAxes, fontsize=10,
+                     verticalalignment='center', bbox=dict(boxstyle='round', facecolor='lightgray'))
+            plt.axis('off')
+            plt.title(f"{col} - Statistics")
+
+            plt.tight_layout()
+            filename = f"5_{i+1}_{col}_visualization.png"
+            path = os.path.join(output_dir, filename)
+            plt.savefig(path, dpi=300, bbox_inches='tight')
+            plt.show()
+
+            results.write(f"[{col}] Statistics:\n")
+            results.write(f"  Count: {df[col].count()}\n")
+            results.write(f"  Mean: {df[col].mean():.4f}\n")
+            results.write(f"  Median: {df[col].median():.4f}\n")
+            results.write(f"  Std Dev: {df[col].std():.4f}\n")
+            results.write(f"  Min: {df[col].min():.4f}\n")
+            results.write(f"  Max: {df[col].max():.4f}\n")
+            results.write(f"  Missing: {df[col].isnull().sum()}\n")
+            results.write(f"  Chart saved: {filename}\n\n")
+            successful.append(col)
+            print(f"Generated and saved visualization for {col}: {filename}")
+        except Exception as e:
+            print(f"Failed to generate chart for {col}: {e}")
+
+    results.write("="*80 + "\n")
+    results.write("Visualization Summary\n")
+    results.write(f"Successful: {len(successful)}\n")
+    results.write(f"Features: {successful}\n")
+    results.close()
+
+    print(f"\n{'='*50}")
+    print(f"All visualizations saved to: {output_dir}")
+    print(f"{'='*50}")
+
+# Execute Step 5
+generate_visualizations(df_current, target_col, output_dir="/content/drive/My Drive/2 auto results/Step5_Visualizations")
+
+# =============================
+# Step 6: Final Summary and Save
+# =============================
+print("\n" + "="*50)
+print("Step 6: Final Summary and Save")
+print("="*50)
+
+if target_col in df_current.columns:
+    print("=== Target Variable Distribution ===")
+    print("Churn counts:")
+    print(df_current[target_col].value_counts())
+    print("\nChurn rate (%):")
+    print(df_current[target_col].value_counts(normalize=True) * 100)
+
+print("\n=== Data Cleaning Summary Report ===")
+print(f"Original data size: {df_original.shape}")
+print(f"Final cleaned size: {df_current.shape}")
+print(f"Data retention rate: {df_current.shape[0]/df_original.shape[0]*100:.2f}%")
+print(f"Feature retention rate: {df_current.shape[1]/df_original.shape[1]*100:.2f}%")
+
+print(f"\nProcessing summary:")
+print(f"1. Removed useless columns: {len(dropped_useless)}")
+print(f"2. Removed redundant columns: {len(dropped_redundant)}")
+print(f"3. Removed high-missing columns: {len(dropped_missing)}")
+print(f"4. Outlier handling applied to: {len(outlier_info)} features")
+
+# Save final cleaned data
+final_path = "/content/drive/My Drive/2 auto results/autoinsurance_churn_final_cleaned.csv"
+df_current.to_csv(final_path, index=False)
+print(f"\nFinal cleaned data saved to: {final_path}")
+
+# Save cleaning report
+cleaning_report = pd.DataFrame({
+    'Step': ['Remove Useless', 'Remove Redundant', 'Handle Missing', 'Handle Outliers'],
+    'Rows After': [df_current.shape[0]] * 4,
+    'Columns After': [
+        df_original.shape[1] - len(dropped_useless),
+        df_original.shape[1] - len(dropped_useless) - len(dropped_redundant),
+        df_original.shape[1] - len(dropped_useless) - len(dropped_redundant) - len(dropped_missing),
+        df_current.shape[1]
+    ],
+    'Items Processed': [len(dropped_useless), len(dropped_redundant), len(dropped_missing), len(outlier_info)]
+})
+report_path = "/content/drive/My Drive/2 auto results/Data_Cleaning_Report.xlsx"
+cleaning_report.to_excel(report_path, index=False)
+print(f"Cleaning report saved to: {report_path}")
+
+print("All Cleaning steps finished")
