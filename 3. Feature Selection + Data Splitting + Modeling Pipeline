@@ -1,0 +1,544 @@
+# =============================
+# Feature Selection + Data Splitting + Modeling Pipeline
+# =============================
+from google.colab import drive
+drive.mount('/content/drive')
+
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.feature_selection import mutual_info_classif
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.preprocessing import LabelEncoder, OneHotEncoder
+from sklearn.linear_model import LogisticRegression
+from sklearn.tree import DecisionTreeClassifier
+from xgboost import XGBClassifier
+from sklearn.metrics import (
+    roc_auc_score, f1_score, recall_score, precision_score,
+    accuracy_score, classification_report
+)
+from imblearn.over_sampling import SMOTE
+from collections import Counter
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# Load cleaned data
+file_path = "/content/drive/My Drive/2 auto results/autoinsurance_churn_final_cleaned.csv"
+df = pd.read_csv(file_path)
+
+target_col = "Churn"
+X = df.drop(columns=[target_col])
+y = df[target_col]
+
+# =============================
+# Enhanced Data Preprocessing (Distinguish ordinal vs nominal categorical features)
+# =============================
+print("="*70)
+print("Data Preprocessing - Feature Type Detection & Handling")
+print("="*70)
+
+print("\nOriginal data types:")
+print(X.dtypes.value_counts())
+print(f"\nTotal missing values: {X.isnull().sum().sum()}")
+
+# Initial classification
+numerical_features = X.select_dtypes(include=[np.number]).columns.tolist()
+categorical_features = X.select_dtypes(include=['object']).columns.tolist()
+datetime_features = []
+
+print(f"\nInitial detection:")
+print(f"  Numeric features: {len(numerical_features)} columns → {numerical_features}")
+print(f"  Object (categorical) features: {len(categorical_features)} columns → {categorical_features}")
+
+# Detect datetime columns
+for col in categorical_features[:]:
+    sample = X[col].dropna().head(10)
+    if len(sample) > 0:
+        try:
+            pd.to_datetime(sample.iloc[0])
+            datetime_features.append(col)
+            categorical_features.remove(col)
+            print(f"  Detected datetime column: {col}")
+        except:
+            pass
+
+# =============================
+# Key Improvement: Distinguish ordinal vs nominal categorical features
+# =============================
+ordinal_features = []
+nominal_features = []
+
+for col in categorical_features:
+    unique_vals = X[col].dropna().unique()
+    sample_val = str(unique_vals[0]) if len(unique_vals) > 0 else ""
+
+    # Detect range-type values (e.g., "75000-99999", "100000-149999")
+    if '-' in sample_val and any(char.isdigit() for char in sample_val):
+        ordinal_features.append(col)
+        print(f"  Ordinal (range-type) feature: {col}")
+        print(f"   Sample values: {list(unique_vals[:3])}")
+    else:
+        nominal_features.append(col)
+
+print(f"\nFinal feature classification:")
+print(f"  Numeric features: {len(numerical_features)} columns")
+print(f"  Ordinal categorical: {len(ordinal_features)} columns → {ordinal_features}")
+print(f"  Nominal categorical: {len(nominal_features)} columns → {nominal_features}")
+print(f"  Datetime features: {len(datetime_features)} columns")
+
+# =============================
+# Data Preprocessing
+# =============================
+X_processed = X.copy()
+
+# 1. Handle datetime features
+for col in datetime_features:
+    X_processed[col] = pd.to_datetime(X_processed[col], errors='coerce')
+    X_processed[f'{col}_year'] = X_processed[col].dt.year
+    X_processed[f'{col}_month'] = X_processed[col].dt.month
+    X_processed[f'{col}_day'] = X_processed[col].dt.day
+    X_processed[f'{col}_weekday'] = X_processed[col].dt.weekday
+    X_processed = X_processed.drop(columns=[col])
+
+# 2. Convert ordinal features to numeric (midpoint of range)
+ordinal_mappings = {}
+for col in ordinal_features:
+    print(f"\nProcessing ordinal feature: {col}")
+    unique_vals = sorted(X_processed[col].dropna().unique())
+    print(f"  Unique values: {unique_vals}")
+
+    def extract_midpoint(val):
+        val_str = str(val).strip()
+        if val_str in ['Missing', 'nan', '']:
+            return np.nan
+        try:
+            if '-' in val_str:
+                parts = val_str.split('-')
+                lower = float(parts[0].replace(',', ''))
+                upper = float(parts[1].replace(',', ''))
+                return (lower + upper) / 2
+            elif '+' in val_str:
+                return float(val_str.replace('+', '').replace(',', ''))
+            else:
+                return float(val_str.replace(',', ''))
+        except:
+            return np.nan
+
+    X_processed[f'{col}_numeric'] = X_processed[col].apply(extract_midpoint)
+    ordinal_mappings[col] = 'converted_to_numeric'
+    print(f"  Converted to numeric (midpoint): {col}_numeric")
+    print(f"  Missing values after conversion: {X_processed[f'{col}_numeric'].isna().sum()}")
+
+# 3. Label encode nominal categorical features (for tree models)
+label_encoders = {}
+for col in nominal_features:
+    le = LabelEncoder()
+    X_processed[col] = X_processed[col].fillna('Missing').astype(str)
+    X_processed[col] = le.fit_transform(X_processed[col])
+    label_encoders[col] = le
+    print(f"  Label encoded: {col} ({len(le.classes_)} categories)")
+
+# 4. Impute missing numeric values
+all_numeric = numerical_features + [f'{col}_numeric' for col in ordinal_features]
+for col in all_numeric:
+    if col in X_processed.columns:
+        missing_count = X_processed[col].isna().sum()
+        if missing_count > 0:
+            median_val = X_processed[col].median()
+            X_processed[col] = X_processed[col].fillna(median_val)
+            print(f"  Imputed missing values: {col} ({missing_count} values, median={median_val:.2f})")
+
+# 5. Drop original ordinal columns (now replaced with numeric version)
+X_processed = X_processed.drop(columns=ordinal_features)
+
+# Final cleanup
+X_processed = X_processed.fillna(0)
+print(f"\nPreprocessing completed:")
+print(f"  Final number of features: {X_processed.shape[1]}")
+print(f"  Remaining missing values: {X_processed.isna().sum().sum()}")
+print(f"  Data types: {X_processed.dtypes.value_counts().to_dict()}")
+
+# =============================
+# Step 1: Train / Validation / Test Split (60% / 20% / 20%)
+# =============================
+X_trainval, X_test, y_trainval, y_test = train_test_split(
+    X_processed, y, test_size=0.2, stratify=y, random_state=42
+)
+X_train, X_val, y_train, y_val = train_test_split(
+    X_trainval, y_trainval, test_size=0.25, stratify=y_trainval, random_state=42
+)
+
+print(f"\nDataset split:")
+print(f"  Training set: {X_train.shape}")
+print(f"  Validation set: {X_val.shape}")
+print(f"  Test set: {X_test.shape}")
+
+# =============================
+# Step 2: Filter Method – Mutual Information
+# =============================
+mi_scores = mutual_info_classif(X_train, y_train, discrete_features='auto', random_state=42)
+mi_series = pd.Series(mi_scores, index=X_train.columns).sort_values(ascending=False)
+
+print("\nTop 10 Features by Mutual Information:")
+print(mi_series.head(10))
+
+plt.figure(figsize=(10, 6))
+sns.barplot(x=mi_series.head(10).values, y=mi_series.head(10).index, palette="viridis")
+plt.title("Top 10 Features – Mutual Information")
+plt.xlabel("Mutual Information Score")
+plt.tight_layout()
+plt.show()
+
+# =============================
+# Step 3: Embedded Method – Random Forest Importance
+# =============================
+rf = RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=-1)
+rf.fit(X_train, y_train)
+importances = pd.Series(rf.feature_importances_, index=X_train.columns).sort_values(ascending=False)
+
+print("\nTop 10 Features by Random Forest Importance:")
+print(importances.head(10))
+
+plt.figure(figsize=(10, 6))
+sns.barplot(x=importances.head(10).values, y=importances.head(10).index, palette="magma")
+plt.title("Top 10 Features – Random Forest Importance")
+plt.xlabel("Feature Importance")
+plt.tight_layout()
+plt.show()
+
+# =============================
+# Step 4: Final Feature Selection (Union of Top from Both Methods)
+# =============================
+top_features = list(set(mi_series.head(15).index) | set(importances.head(15).index))
+
+print(f"\nFinal selected features: {len(top_features)}")
+print("Selected key features:")
+for i, feat in enumerate(top_features, 1):
+    print(f" {i:2d}. {feat}")
+
+# Save reduced dataset
+df_selected = pd.concat([X_processed[top_features], y], axis=1)
+output_path = "/content/drive/MyDrive/2 auto results/autoinsurance_churn_selected.csv"
+df_selected.to_csv(output_path, index=False)
+print(f"\nReduced dataset saved to: {output_path}")
+
+# Use selected features
+X_train_sel = X_train[top_features]
+X_val_sel = X_val[top_features]
+X_test_sel = X_test[top_features]
+
+# =============================
+# Step 5: Feature Correlation Heatmap
+# =============================
+plt.figure(figsize=(14, 12))
+correlation_matrix = df_selected[top_features].corr()
+sns.heatmap(
+    correlation_matrix,
+    annot=True,
+    fmt='.2f',
+    cmap='coolwarm',
+    center=0,
+    square=True,
+    linewidths=0.5,
+    cbar_kws={"shrink": 0.8}
+)
+plt.title('Feature Correlation Heatmap (Selected Features)',
+          fontsize=16, fontweight='bold', pad=20)
+plt.xticks(rotation=45, ha='right')
+plt.yticks(rotation=0)
+plt.tight_layout()
+
+heatmap_path = "/content/drive/My Drive/2 auto results/feature_correlation_heatmap.png"
+plt.savefig(heatmap_path, dpi=300, bbox_inches='tight')
+print(f"\nHeatmap saved to: {heatmap_path}")
+plt.show()
+
+# Print highly correlated pairs
+print("\nHighly correlated feature pairs (|correlation| > 0.7):")
+high_corr = []
+for i in range(len(correlation_matrix.columns)):
+    for j in range(i+1, len(correlation_matrix.columns)):
+        if abs(correlation_matrix.iloc[i, j]) > 0.7:
+            high_corr.append({
+                'Feature 1': correlation_matrix.columns[i],
+                'Feature 2': correlation_matrix.columns[j],
+                'Correlation': correlation_matrix.iloc[i, j]
+            })
+if high_corr:
+    for pair in sorted(high_corr, key=lambda x: abs(x['Correlation']), reverse=True):
+        print(f" {pair['Feature 1']} ↔ {pair['Feature 2']}: {pair['Correlation']:.3f}")
+else:
+    print("  No highly correlated feature pairs found")
+
+# =============================
+# Step 6: Prepare One-Hot Encoded Data for Linear Models
+# =============================
+print("\n" + "="*70)
+print("Preparing One-Hot Encoded Data for Linear Models")
+print("="*70)
+
+# Identify nominal categorical columns among selected features
+selected_categorical = [col for col in top_features if col in nominal_features]
+print(f"\nCategorical features requiring One-Hot encoding ({len(selected_categorical)}):")
+for col in selected_categorical:
+    print(f" - {col}")
+
+if len(selected_categorical) > 0:
+    ohe = OneHotEncoder(drop='first', sparse_output=False, handle_unknown='ignore')
+
+    X_train_ohe = ohe.fit_transform(X_train_sel[selected_categorical])
+    X_val_ohe = ohe.transform(X_val_sel[selected_categorical])
+    X_test_ohe = ohe.transform(X_test_sel[selected_categorical])
+
+    numeric_cols = [c for c in top_features if c not in selected_categorical]
+
+    X_train_lr = np.hstack([X_train_sel[numeric_cols].values, X_train_ohe])
+    X_val_lr = np.hstack([X_val_sel[numeric_cols].values, X_val_ohe])
+    X_test_lr = np.hstack([X_test_sel[numeric_cols].values, X_test_ohe])
+
+    print(f"\nLinear model data shapes:")
+    print(f"  Training set: {X_train_lr.shape}")
+    print(f"  Validation set: {X_val_lr.shape}")
+    print(f"  Test set: {X_test_lr.shape}")
+    print(f"  New features from One-Hot: {X_train_ohe.shape[1]}")
+else:
+    X_train_lr = X_train_sel.values
+    X_val_lr = X_val_sel.values
+    X_test_lr = X_test_sel.values
+    print("  No categorical features need One-Hot encoding")
+
+# =============================
+# Class Imbalance Check
+# =============================
+print("\n" + "="*70)
+print("Class Imbalance Check")
+print("="*70)
+print("Original class distribution:")
+print(f"  Training set: {dict(Counter(y_train))}")
+print(f"  Validation set: {dict(Counter(y_val))}")
+print(f"  Test set: {dict(Counter(y_test))}")
+
+imbalance_ratio = y_train.value_counts()[0] / y_train.value_counts()[1]
+print(f"\nImbalance ratio (Non-Churn : Churn) = {imbalance_ratio:.2f}:1")
+
+# =============================
+# SMOTE Oversampling (Separate for tree and linear models)
+# =============================
+print("\nApplying SMOTE oversampling...")
+# Tree models
+smote_tree = SMOTE(random_state=42, k_neighbors=min(5, Counter(y_train)[1]-1))
+X_train_bal_tree, y_train_bal = smote_tree.fit_resample(X_train_sel, y_train)
+print(f"  Tree models after SMOTE: {X_train_bal_tree.shape}, class distribution: {dict(Counter(y_train_bal))}")
+
+# Linear models
+smote_lr = SMOTE(random_state=42, k_neighbors=min(5, Counter(y_train)[1]-1))
+X_train_bal_lr, y_train_bal_lr = smote_lr.fit_resample(X_train_lr, y_train)
+print(f"  Linear models after SMOTE: {X_train_bal_lr.shape}, class distribution: {dict(Counter(y_train_bal_lr))}")
+
+# =============================
+# Model Definitions (Tree vs Linear)
+# =============================
+models = {
+    "Logistic Regression (Weighted)": {
+        'model': LogisticRegression(max_iter=1000, solver="liblinear", class_weight="balanced", random_state=42),
+        'type': 'linear',
+        'use_smote': False
+    },
+    "Logistic Regression (SMOTE)": {
+        'model': LogisticRegression(max_iter=1000, solver="liblinear", random_state=42),
+        'type': 'linear',
+        'use_smote': True
+    },
+    "Decision Tree (Weighted)": {
+        'model': DecisionTreeClassifier(max_depth=8, min_samples_split=10, min_samples_leaf=5,
+                                       class_weight="balanced", random_state=42),
+        'type': 'tree',
+        'use_smote': False
+    },
+    "Random Forest (Weighted)": {
+        'model': RandomForestClassifier(n_estimators=200, max_depth=10, min_samples_split=10,
+                                       min_samples_leaf=5, class_weight="balanced", random_state=42, n_jobs=-1),
+        'type': 'tree',
+        'use_smote': False
+    },
+    "Random Forest (SMOTE)": {
+        'model': RandomForestClassifier(n_estimators=200, max_depth=10, min_samples_split=10,
+                                       min_samples_leaf=5, random_state=42, n_jobs=-1),
+        'type': 'tree',
+        'use_smote': True
+    },
+    "XGBoost (Weighted)": {
+        'model': XGBClassifier(n_estimators=200, max_depth=6, learning_rate=0.1, subsample=0.8,
+                              colsample_bytree=0.8, scale_pos_weight=imbalance_ratio,
+                              eval_metric="logloss", random_state=42),
+        'type': 'tree',
+        'use_smote': False
+    },
+    "XGBoost (SMOTE)": {
+        'model': XGBClassifier(n_estimators=200, max_depth=6, learning_rate=0.1, subsample=0.8,
+                              colsample_bytree=0.8, eval_metric="logloss", random_state=42),
+        'type': 'tree',
+        'use_smote': True
+    },
+}
+
+# =============================
+# Training & Validation Evaluation
+# =============================
+val_results = []
+trained_models = {}
+print("\n" + "="*70)
+print("Training Models & Validation Set Evaluation")
+print("="*70)
+
+for name, config in models.items():
+    print(f"\nTraining {name}...")
+    model = config['model']
+    model_type = config['type']
+    use_smote = config['use_smote']
+
+    if model_type == 'linear':
+        X_tr, y_tr = (X_train_bal_lr, y_train_bal_lr) if use_smote else (X_train_lr, y_train)
+        X_vl = X_val_lr
+    else:
+        X_tr, y_tr = (X_train_bal_tree, y_train_bal) if use_smote else (X_train_sel, y_train)
+        X_vl = X_val_sel
+
+    model.fit(X_tr, y_tr)
+
+    y_pred = model.predict(X_vl)
+    y_proba = model.predict_proba(X_vl)[:, 1]
+
+    auc = roc_auc_score(y_val, y_proba)
+    f1 = f1_score(y_val, y_pred)
+    recall = recall_score(y_val, y_pred)
+    precision = precision_score(y_val, y_pred)
+    acc = accuracy_score(y_val, y_pred)
+
+    val_results.append([name, auc, f1, recall, precision, acc])
+    trained_models[name] = {'model': model, 'type': model_type}
+
+    print(f"  Validation → AUC: {auc:.4f} | F1: {f1:.4f} | Recall: {recall:.4f} | Precision: {precision:.4f}")
+
+val_df = pd.DataFrame(val_results, columns=["Model", "AUC", "F1", "Recall", "Precision", "Accuracy"])
+print("\nValidation Set Comparison:")
+print(val_df.round(4))
+
+# =============================
+# Final Test Set Evaluation
+# =============================
+test_results = []
+print("\n" + "="*70)
+print("Final Test Set Evaluation")
+print("="*70)
+
+for name, config in trained_models.items():
+    model = config['model']
+    model_type = config['type']
+    X_te = X_test_lr if model_type == 'linear' else X_test_sel
+
+    y_pred = model.predict(X_te)
+    y_proba = model.predict_proba(X_te)[:, 1]
+
+    auc = roc_auc_score(y_test, y_proba)
+    f1 = f1_score(y_test, y_pred)
+    recall = recall_score(y_test, y_pred)
+    precision = precision_score(y_test, y_pred)
+    acc = accuracy_score(y_test, y_pred)
+
+    test_results.append([name, auc, f1, recall, precision, acc])
+    print(f"{name:35s} → AUC: {auc:.4f} | F1: {f1:.4f} | Recall: {recall:.4f}")
+
+test_df = pd.DataFrame(test_results, columns=["Model", "AUC", "F1", "Recall", "Precision", "Accuracy"])
+
+# Composite score prioritizing Recall and F1
+test_df['Composite Score'] = 0.3 * test_df['AUC'] + 0.4 * test_df['F1'] + 0.3 * test_df['Recall']
+best_idx = test_df['Composite Score'].idxmax()
+best_model_name = test_df.loc[best_idx, "Model"]
+best_model_config = trained_models[best_model_name]
+
+print(f"\nBest Model (Composite Score): {best_model_name}")
+print(f"Composite Score: {test_df.loc[best_idx, 'Composite Score']:.4f}")
+
+# Detailed report for best model
+print(f"\nDetailed Classification Report – {best_model_name}")
+X_te_best = X_test_lr if best_model_config['type'] == 'linear' else X_test_sel
+y_pred_best = best_model_config['model'].predict(X_te_best)
+print(classification_report(y_test, y_pred_best, target_names=['Retained', 'Churned']))
+
+# =============================
+# Visualization Comparison
+# =============================
+fig, axes = plt.subplots(2, 2, figsize=(20, 12))
+
+val_df.set_index("Model")[["AUC", "F1", "Recall", "Precision"]].plot(
+    kind="bar", ax=axes[0,0], title="Validation Set Performance", rot=45, colormap="Set2")
+axes[0,0].set_ylabel("Score"); axes[0,0].grid(True, alpha=0.3); axes[0,0].legend(loc='lower right')
+
+test_df.set_index("Model")[["AUC", "F1", "Recall", "Precision"]].plot(
+    kind="bar", ax=axes[0,1], title="Test Set Performance", rot=45, colormap="Set2")
+axes[0,1].set_ylabel("Score"); axes[0,1].grid(True, alpha=0.3); axes[0,1].legend(loc='lower right')
+
+pd.DataFrame({'Validation': val_df.set_index('Model')['Recall'],
+              'Test': test_df.set_index('Model')['Recall']}).plot(
+    kind="bar", ax=axes[1,0], title="Recall Comparison (Churn Detection Ability)",
+    color=['#4e79a7', '#f28e2b'], rot=45)
+axes[1,0].set_ylabel("Recall"); axes[1,0].grid(True, alpha=0.3)
+
+pd.DataFrame({'Validation': val_df.set_index('Model')['F1'],
+              'Test': test_df.set_index('Model')['F1']}).plot(
+    kind="bar", ax=axes[1,1], title="F1 Score Comparison",
+    color=['#59a14f', '#e15759'], rot=45)
+axes[1,1].set_ylabel("F1 Score"); axes[1,1].grid(True, alpha=0.3)
+
+plt.tight_layout()
+viz_path = "/content/drive/My Drive/2 auto results/model_comparison.png"
+plt.savefig(viz_path, dpi=300, bbox_inches='tight')
+print(f"\nVisualization saved to: {viz_path}")
+plt.show()
+
+# =============================
+# Final Insights & Recommendations
+# =============================
+print("\n" + "="*70)
+print("FINAL INSIGHTS & RECOMMENDATIONS")
+print("="*70)
+
+best_recall = test_df['Recall'].max()
+best_f1 = test_df['F1'].max()
+best_auc = test_df['AUC'].max()
+
+print(f"1. Best Performance Metrics:")
+print(f"   • Highest Recall: {best_recall:.4f} → Can identify {best_recall*100:.1f}% of churning customers")
+print(f"   • Highest F1:     {best_f1:.4f}")
+print(f"   • Highest AUC:    {best_auc:.4f}")
+
+print(f"\n2. Imbalance Handling Comparison:")
+weighted_recall = test_df[test_df['Model'].str.contains('Weighted')]['Recall'].mean()
+smote_recall = test_df[test_df['Model'].str.contains('SMOTE')]['Recall'].mean()
+print(f"   • Class weighting average Recall: {weighted_recall:.4f}")
+print(f"   • SMOTE oversampling average Recall: {smote_recall:.4f}")
+
+print(f"\n3. Linear vs Tree Models:")
+linear_models = test_df[test_df['Model'].str.contains('Logistic')]
+tree_models = test_df[~test_df['Model'].str.contains('Logistic')]
+print(f"   • Linear models average F1: {linear_models['F1'].mean():.4f}")
+print(f"   • Tree models average F1: {tree_models['F1'].mean():.4f}")
+
+print(f"\n4. Recommended Model:")
+print(f"   → {best_model_name}")
+print(f"   This model achieves the best balance between churn detection (Recall) and reliability (F1/AUC)")
+
+print(f"\n5. Business Recommendations:")
+print(f"   • Deploy this model to flag {best_recall*100:.1f}% of at-risk customers")
+print(f"   • Prioritize retention campaigns on high-probability churn predictions")
+print(f"   • Retrain the model quarterly with fresh data")
+print(f"   • Combine model output with business rules (e.g., customer lifetime value, claim history) for final decisions")
+
+print(f"\n6. Preprocessing Improvements Applied:")
+print(f"   • Ordinal categorical features converted to numeric (midpoint of ranges)")
+print(f"   • Linear models use One-Hot encoding")
+print(f"   • Tree models use Label encoding")
+print(f"   • Optimal data format prepared separately for each model type")
+
+print("\nPipeline completed successfully! Model ready for deployment.")
