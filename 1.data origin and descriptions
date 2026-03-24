@@ -1,0 +1,208 @@
+# =============================
+#  Exploratory Data Analysis (EDA)
+# =============================
+
+# =============================
+# Mount Google Drive
+# =============================
+from google.colab import drive
+drive.mount('/content/drive')
+
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import numpy as np
+import os
+from datetime import datetime
+
+# Load data
+file_path = "/content/drive/My Drive/autoinsurance_churn.csv"
+df = pd.read_csv(file_path)
+
+target_col = "Churn"
+
+# Create output directory
+output_dir = "/content/drive/My Drive/EDA_Results"
+os.makedirs(output_dir, exist_ok=True)
+
+# Create a text file to save all results
+results_file = os.path.join(output_dir, "EDA_Statistics_Results.txt")
+results = open(results_file, 'w', encoding='utf-8')
+
+# Write analysis timestamp
+results.write(f"EDA Analysis Report\n")
+results.write(f"Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+results.write("="*80 + "\n\n")
+
+# =============================
+# 1. Data Overview & Preview
+# =============================
+results.write("="*80 + "\n")
+results.write("1. Data Overview & Preview\n")
+results.write("="*80 + "\n\n")
+
+print("Data shape:", df.shape)
+results.write(f"Data shape: {df.shape}\n\n")
+
+print("First 5 rows of data:\n", df.head())
+results.write("First 5 rows:\n")
+results.write(df.head().to_string() + "\n\n")
+
+# Column data types
+print("\nColumn data types:")
+print(df.dtypes)
+results.write("Column data types:\n")
+results.write(df.dtypes.to_string() + "\n\n")
+
+# Data type summary
+print("\nData type distribution:")
+print(df.dtypes.value_counts())
+results.write("Data type distribution:\n")
+results.write(df.dtypes.value_counts().to_string() + "\n\n")
+
+# Separate numeric and categorical columns
+num_cols = df.select_dtypes(include=["int64", "float64"]).columns.tolist()
+cat_cols = df.select_dtypes(include=["object", "bool"]).columns.tolist()
+
+print(f"\nNumber of numeric columns: {len(num_cols)}")
+print(f"Number of categorical columns: {len(cat_cols)}")
+results.write(f"Number of numeric columns: {len(num_cols)}\n")
+results.write(f"Numeric columns: {num_cols}\n\n")
+results.write(f"Number of categorical columns: {len(cat_cols)}\n")
+results.write(f"Categorical columns: {cat_cols}\n\n")
+
+# =============================
+# 2. Missing Value Analysis
+# =============================
+results.write("="*80 + "\n")
+results.write("2. Missing Value Analysis\n")
+results.write("="*80 + "\n\n")
+
+missing_values = df.isnull().sum()
+print("\nMissing value counts:\n", missing_values)
+results.write("Missing value counts:\n")
+results.write(missing_values.to_string() + "\n\n")
+
+# Missing percentage
+missing_percent = (df.isnull().sum() / len(df)) * 100
+missing_summary = pd.DataFrame({
+    'Missing Count': missing_values,
+    'Missing Percentage (%)': missing_percent.round(2)
+})
+
+results.write("Detailed missing value statistics:\n")
+results.write(missing_summary.to_string() + "\n\n")
+
+# =============================
+# 3. Target Variable Distribution
+# =============================
+results.write("="*80 + "\n")
+results.write("3. Target Variable Distribution\n")
+results.write("="*80 + "\n\n")
+
+print("\nChurn distribution (absolute counts):")
+print(df[target_col].value_counts())
+results.write("Churn distribution (absolute counts):\n")
+results.write(df[target_col].value_counts().to_string() + "\n\n")
+
+churn_percent = df[target_col].value_counts(normalize=True) * 100
+print("\nChurn rate (%):")
+print(churn_percent)
+results.write("Churn rate (%):\n")
+results.write(churn_percent.to_string() + "\n\n")
+
+# Save bar chart
+plt.figure(figsize=(6, 3))
+churn_percent.plot(kind="bar", color=["skyblue", "salmon"])
+plt.title("Customer Churn Distribution (Bar Chart)")
+plt.ylabel("Percentage (%)")
+plt.xticks(rotation=0)
+plt.tight_layout()
+plt.savefig(os.path.join(output_dir, "3_Churn_Distribution_Bar.png"), dpi=300, bbox_inches='tight')
+plt.show()
+
+# Save pie chart
+plt.figure(figsize=(5, 5))
+churn_percent.plot(kind="pie", autopct="%.1f%%", colors=["skyblue", "salmon"])
+plt.title("Customer Churn Distribution (Pie Chart)")
+plt.ylabel("")
+plt.tight_layout()
+plt.savefig(os.path.join(output_dir, "3_Churn_Distribution_Pie.png"), dpi=300, bbox_inches='tight')
+plt.show()
+
+# =============================
+# 4. Numeric Variable Descriptive Statistics
+# =============================
+results.write("="*80 + "\n")
+results.write("4. Descriptive Statistics of Numeric Variables\n")
+results.write("="*80 + "\n\n")
+
+desc_stats = df.describe()
+print("\nDescriptive statistics of numeric variables:\n", desc_stats)
+results.write("Descriptive statistics of numeric variables:\n")
+results.write(desc_stats.to_string() + "\n\n")
+
+# Save to CSV
+desc_stats.to_csv(os.path.join(output_dir, "4_Numeric_Variables_Statistics.csv"))
+
+# =============================
+# 5. Correlation Analysis of Numeric Variables
+# =============================
+results.write("="*80 + "\n")
+results.write("5. Correlation Analysis\n")
+results.write("="*80 + "\n\n")
+
+corr_matrix = df.corr(numeric_only=True)
+
+# Save correlation heatmap
+plt.figure(figsize=(12, 8))
+sns.heatmap(corr_matrix, cmap="coolwarm", annot=False, center=0)
+plt.title("Correlation Heatmap of Numeric Variables")
+plt.tight_layout()
+plt.savefig(os.path.join(output_dir, "5_Correlation_Heatmap.png"), dpi=300, bbox_inches='tight')
+plt.show()
+
+# Save full correlation matrix
+corr_matrix.to_csv(os.path.join(output_dir, "5_Correlation_Matrix.csv"))
+
+# Correlation with target variable
+if target_col in corr_matrix.columns:
+    corr_with_target = corr_matrix[target_col].drop(target_col).abs().sort_values(ascending=False)
+    print("\nTop 10 features most correlated with Churn:")
+    print(corr_with_target.head(10))
+    results.write("Top 10 features most correlated with Churn:\n")
+    results.write(corr_with_target.head(10).to_string() + "\n\n")
+
+    # Save full ranking
+    corr_with_target.to_csv(os.path.join(output_dir, "5_Churn_Correlation_Ranking.csv"))
+
+    # Save Top 10 bar chart
+    plt.figure(figsize=(8, 6))
+    corr_with_target.head(10).plot(kind="barh", color="steelblue")
+    plt.title("Top 10 Features Most Correlated with Churn")
+    plt.xlabel("Absolute Correlation Coefficient")
+    plt.gca().invert_yaxis()
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "5_Top10_Churn_Correlation.png"), dpi=300, bbox_inches='tight')
+    plt.show()
+
+# =============================
+# Finalize and close results file
+# =============================
+results.write("="*80 + "\n")
+results.write("EDA Analysis Completed \n")
+results.write("="*80 + "\n")
+results.close()
+
+print(f"\nAll results have been saved to: {output_dir}")
+print("\nSaved files:")
+print("  - EDA_Statistics_Results.txt          → Full text report")
+print("  - 3_Churn_Distribution_Bar.png        → Churn bar chart")
+print("  - 3_Churn_Distribution_Pie.png        → Churn pie chart")
+print("  - 4_Numeric_Variables_Statistics.csv  → Numeric summary stats")
+print("  - 5_Correlation_Heatmap.png           → Correlation heatmap")
+print("  - 5_Correlation_Matrix.csv            → Full correlation matrix")
+print("  - 5_Churn_Correlation_Ranking.csv     → Feature ranking by correlation")
+print("  - 5_Top10_Churn_Correlation.png       → Top 10 correlation bar chart")
+
+print("\nEDA completed and all outputs saved ")
